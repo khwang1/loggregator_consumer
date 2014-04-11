@@ -12,6 +12,8 @@ import (
 	"net/url"
 	"sort"
 	"time"
+	"io/ioutil"
+	"encoding/binary"
 )
 
 var (
@@ -99,7 +101,7 @@ func (cnsmr *consumer) Recent(appGuid string, authToken string) ([]*logmessage.L
 	cnsmr.ws, err = cnsmr.establishWebsocketConnection(dumpPath, authToken)
 
 	if err != nil {
-		return nil, err
+		return cnsmr.RecentOverHttp(appGuid, authToken)
 	}
 
 	messages := []*logmessage.LogMessage{}
@@ -124,6 +126,55 @@ drainLoop:
 
 	return messages, nil
 }
+
+func (cnsmr *consumer) RecentOverHttp(appGuid string, authToken string) ([]*logmessage.LogMessage, error) {
+
+	dumpPath := fmt.Sprintf("/dump_http/?app=%s", appGuid)
+	res, err := cnsmr.makeHttpRequest(dumpPath, authToken)
+	if res != nil {
+		defer res.Body.Close()
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	bodyData, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		return nil, fmt.Errorf("Error while getting recent logs over http: %v", err)
+	} else if cnsmr.callback != nil {
+		cnsmr.callback()
+	}
+
+	messages := []*logmessage.LogMessage{}
+
+	for bodyOffset := 0 ; bodyOffset < len(bodyData); {
+		if bodyOffset + 4 > len(bodyData) {
+			return nil, errors.New("truncated message length")
+		}
+
+		lengthBytes := bodyData[bodyOffset:bodyOffset + 4]
+		messageLength := int(binary.BigEndian.Uint32(lengthBytes))
+		bodyOffset += 4
+
+		if bodyOffset + messageLength > len(bodyData) {
+			return nil, errors.New("truncated message")
+		}
+
+		messageBytes := bodyData[bodyOffset:bodyOffset + messageLength]
+		bodyOffset += messageLength
+		msg, err := logmessage.ParseMessage(messageBytes)
+		if err != nil {
+			return nil, fmt.Errorf("corrupted message: %v", err)
+
+		}
+
+		messages = append(messages, msg.GetLogMessage())
+	}
+
+	return messages, nil
+}
+
 
 /* Close terminates the websocket connection to loggregator.
  */
@@ -200,15 +251,30 @@ func (cnsmr *consumer) establishWebsocketConnection(path string, authToken strin
 
 	ws, resp, err := dialer.Dial(cnsmr.endpoint+path, header)
 
-	if err == nil && cnsmr.callback != nil {
-		cnsmr.callback()
-	}
 	if resp != nil && resp.StatusCode == http.StatusUnauthorized {
 		bodyData := make([]byte, 4096)
 		resp.Body.Read(bodyData)
 		resp.Body.Close()
 		err = errors.New(string(bodyData))
 	}
+	if err == nil && cnsmr.callback != nil {
+		cnsmr.callback()
+	}
 
 	return ws, err
+}
+
+func (cnsmr *consumer) makeHttpRequest(path string, authToken string) (*http.Response, error) {
+	req, _ := http.NewRequest("GET", cnsmr.endpoint + path, nil)
+	req.Header.Set("Authorization", authToken)
+	tr := &http.Transport{TLSClientConfig: cnsmr.tlsConfig}
+	client := &http.Client{Transport: tr}
+
+	res, err := client.Do(req)
+
+	if err == nil && res.StatusCode != 200 {
+		err = fmt.Errorf("Non 200 response from loggregator: %d", res.StatusCode)
+	}
+
+	return res, err
 }
